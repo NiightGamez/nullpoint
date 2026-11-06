@@ -1,0 +1,14 @@
+# Node
+node_modules/
+dist/
+.vite/
+
+# Rust / Cargo build outputs
+src-tauri/target/
+target/
+
+# OS / Editor files
+.DS_Store
+*.log
+.env
+.env.*
