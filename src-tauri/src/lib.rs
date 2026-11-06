@@ -1,13 +1,16 @@
+use safelog::DisplayRedacted;
+use arti_client::{TorClient, TorClientConfig};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State, Window};
+use tauri_plugin_notification::NotificationExt;
 use tokio::net::UdpSocket;
-use tokio::time::timeout;
+use tokio::sync::RwLock;
+use tor_rtcompat::PreferredRuntime;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "kind")]
@@ -30,6 +33,22 @@ pub enum Packet {
         text: String,
         timestamp: String,
     },
+    #[serde(rename = "friend_request")]
+    FriendRequest {
+        id: String,
+        sender_pubkey: String,
+        sender_alias: String,
+        sender_addr: String,
+        recipient_pubkey: String,
+    },
+    #[serde(rename = "friend_accept")]
+    FriendAccept {
+        id: String,
+        sender_pubkey: String,
+        sender_alias: String,
+        sender_addr: String,
+        recipient_pubkey: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -41,87 +60,67 @@ pub struct NodeIdentity {
     pub shareable_invite: String,
     pub alias: String,
     pub target_alias: String,
-    pub wan_endpoint: Option<String>,
+    pub onion_address: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct NotificationFilterSettings {
+    pub user_status: String,
+    pub blocked_pubkeys: HashSet<String>,
+    pub muted_dm_pubkeys: HashSet<String>,
+    pub muted_servers: HashSet<String>,
+    pub muted_channels: HashSet<String>,
 }
 
 pub struct SocketsState {
-    pub main_socket: Arc<UdpSocket>, // port 9876
-    pub peer_socket: Arc<UdpSocket>, // port 9877
-    pub main_wan: Arc<tokio::sync::Mutex<Option<SocketAddr>>>,
+    pub main_socket: Arc<UdpSocket>,
+    pub peer_socket: Arc<UdpSocket>,
+    pub filters: Arc<RwLock<NotificationFilterSettings>>,
+    pub tor_client: Arc<RwLock<Option<Arc<TorClient<PreferredRuntime>>>>>,
+    pub onion_address: Arc<RwLock<Option<String>>>,
 }
 
-// Minimal RFC 5389 STUN Binding Request header (20 bytes)
-fn create_stun_request() -> [u8; 20] {
-    let mut req = [0u8; 20];
-    req[0] = 0x00; // Binding Request
-    req[1] = 0x01;
-    req[2] = 0x00; // Length: 0 attributes
-    req[3] = 0x00;
-    req[4..8].copy_from_slice(&0x2112A442u32.to_be_bytes()); // Magic Cookie
-    for b in &mut req[8..20] {
-        *b = rand::random();
-    }
-    req
+#[tauri::command]
+fn generate_new_identity() -> Result<serde_json::Value, String> {
+    let mut csprng = OsRng;
+    let signing_key = SigningKey::generate(&mut csprng);
+    let secret_bytes = signing_key.to_bytes();
+    let pubkey_bytes = signing_key.verifying_key().to_bytes();
+
+    Ok(serde_json::json!({
+        "secret_key": B64.encode(secret_bytes),
+        "pubkey": format!("ed25519_{}", B64.encode(pubkey_bytes))
+    }))
 }
 
-fn parse_stun_response(buf: &[u8]) -> Option<SocketAddr> {
-    if buf.len() < 20 || buf[0] != 0x01 || buf[1] != 0x01 {
-        return None;
+#[tauri::command]
+fn restore_identity_from_key(secret_b64: String) -> Result<serde_json::Value, String> {
+    let secret_bytes = B64.decode(secret_b64.trim())
+        .map_err(|e| format!("Invalid base64 key: {}", e))?;
+
+    if secret_bytes.len() != 32 {
+        return Err("Invalid secret key length (expected 32 bytes)".into());
     }
 
-    let magic_cookie = 0x2112A442u32;
-    let mut offset = 20;
+    let mut key_array = [0u8; 32];
+    key_array.copy_from_slice(&secret_bytes);
+    let signing_key = SigningKey::from_bytes(&key_array);
+    let pubkey_bytes = signing_key.verifying_key().to_bytes();
 
-    while offset + 4 <= buf.len() {
-        let attr_type = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
-        let attr_len = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
-        offset += 4;
-
-        if offset + attr_len > buf.len() {
-            break;
-        }
-
-        if attr_type == 0x0020 && attr_len >= 8 {
-            let family = buf[offset + 1];
-            if family == 0x01 {
-                let raw_port = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]);
-                let port = raw_port ^ ((magic_cookie >> 16) as u16);
-                let raw_ip = u32::from_be_bytes([
-                    buf[offset + 4],
-                    buf[offset + 5],
-                    buf[offset + 6],
-                    buf[offset + 7],
-                ]);
-                let ip = std::net::Ipv4Addr::from(raw_ip ^ magic_cookie);
-                return Some(SocketAddr::new(std::net::IpAddr::V4(ip), port));
-            }
-        }
-        offset += (attr_len + 3) & !3;
-    }
-    None
+    Ok(serde_json::json!({
+        "secret_key": B64.encode(secret_bytes),
+        "pubkey": format!("ed25519_{}", B64.encode(pubkey_bytes))
+    }))
 }
 
-async fn resolve_stun_pool(socket: &UdpSocket, servers: &[&str]) -> Option<SocketAddr> {
-    let req = create_stun_request();
-    let mut buf = vec![0u8; 1024];
-
-    for server in servers {
-        if let Ok(mut addrs) = tokio::net::lookup_host(server).await {
-            if let Some(target) = addrs.next() {
-                if socket.send_to(&req, target).await.is_ok() {
-                    if let Ok(Ok((len, _))) =
-                        timeout(Duration::from_millis(800), socket.recv_from(&mut buf)).await
-                    {
-                        if let Some(addr) = parse_stun_response(&buf[..len]) {
-                            println!("[STUN] Resolved via {}: WAN = {}", server, addr);
-                            return Some(addr);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
+#[tauri::command]
+async fn update_notification_filters(
+    settings: NotificationFilterSettings,
+    state: State<'_, SocketsState>,
+) -> Result<(), String> {
+    let mut lock = state.filters.write().await;
+    *lock = settings;
+    Ok(())
 }
 
 #[tauri::command]
@@ -143,14 +142,13 @@ async fn init_node(
         (9876, 9877, "Alpha Host", "Beta Client")
     };
 
-    let wan_lock = state.main_wan.lock().await;
-    let wan_endpoint = wan_lock.map(|a| a.to_string());
+    let onion_lock = state.onion_address.read().await;
+    let onion_addr = onion_lock.clone();
 
-    let invite_addr = wan_endpoint
-        .clone()
-        .unwrap_or_else(|| format!("127.0.0.1:{}", local_port));
-
-    let invite = format!("mesh://{}@{}", pubkey_str, invite_addr);
+    let invite = match &onion_addr {
+        Some(onion) => format!("nullpoint://{}@{}", pubkey_str, onion),
+        None => format!("nullpoint://{}@127.0.0.1:{}", pubkey_str, local_port),
+    };
 
     Ok(NodeIdentity {
         label,
@@ -160,7 +158,7 @@ async fn init_node(
         shareable_invite: invite,
         alias: alias.into(),
         target_alias: target_alias.into(),
-        wan_endpoint,
+        onion_address: onion_addr,
     })
 }
 
@@ -171,32 +169,126 @@ async fn send_packet(
     packet: Packet,
     state: State<'_, SocketsState>,
 ) -> Result<Packet, String> {
+    use tokio::io::AsyncWriteExt;
+
     let serialized = serde_json::to_vec(&packet).map_err(|e| e.to_string())?;
     let label = window.label();
 
-    let socket = if label == "peer" {
-        state.peer_socket.clone()
-    } else {
-        state.main_socket.clone()
-    };
+    if target_addr.contains(".onion") {
+        let tor_guard = state.tor_client.read().await;
+        let tor_client = tor_guard
+            .as_ref()
+            .ok_or_else(|| "Tor client is still bootstrapping circuits. Please wait a moment.".to_string())?;
 
-    let target = if target_addr.contains(':') {
-        target_addr
-    } else {
-        format!("{}:9876", target_addr)
-    };
+        let onion_host = target_addr
+            .trim_start_matches("nullpoint://")
+            .split('@')
+            .last()
+            .unwrap_or(&target_addr);
 
-    socket
-        .send_to(&serialized, &target)
-        .await
-        .map_err(|e| format!("Send failed from {}: {}", label, e))?;
+        let target_dest = if onion_host.contains(':') {
+            onion_host.to_string()
+        } else {
+            format!("{}:9876", onion_host)
+        };
+
+        let mut stream = tor_client
+            .connect(target_dest)
+            .await
+            .map_err(|e| format!("Tor circuit connection failed: {}", e))?;
+
+        stream
+            .write_all(&serialized)
+            .await
+            .map_err(|e| format!("Failed writing packet to Tor stream: {}", e))?;
+        stream
+            .flush()
+            .await
+            .map_err(|e| format!("Failed flushing Tor stream: {}", e))?;
+    } else {
+        let socket = if label == "peer" {
+            state.peer_socket.clone()
+        } else {
+            state.main_socket.clone()
+        };
+
+        let target = if target_addr.contains(':') {
+            target_addr
+        } else {
+            format!("{}:9876", target_addr)
+        };
+
+        socket
+            .send_to(&serialized, &target)
+            .await
+            .map_err(|e| format!("Send failed from {}: {}", label, e))?;
+    }
 
     Ok(packet)
+}
+
+async fn trigger_native_notification(
+    handle: &AppHandle,
+    pkt: &Packet,
+    filters_lock: &Arc<RwLock<NotificationFilterSettings>>,
+) {
+    let filters = filters_lock.read().await;
+
+    if filters.user_status == "dnd" {
+        return;
+    }
+
+    match pkt {
+        Packet::DirectMessage { sender_pubkey, sender_alias, text, .. } => {
+            if filters.blocked_pubkeys.contains(sender_pubkey)
+                || filters.muted_dm_pubkeys.contains(sender_pubkey)
+            {
+                return;
+            }
+
+            let _ = handle
+                .notification()
+                .builder()
+                .title(format!("NullPoint: DM from {}", sender_alias))
+                .body(text)
+                .show();
+        }
+        Packet::ServerMessage { room_id, channel, sender_alias, text, .. } => {
+            let ch_key = format!("{}:{}", room_id, channel);
+            if filters.muted_servers.contains(room_id) || filters.muted_channels.contains(&ch_key) {
+                return;
+            }
+
+            let _ = handle
+                .notification()
+                .builder()
+                .title(format!("NullPoint: #{}: {}", channel, sender_alias))
+                .body(text)
+                .show();
+        }
+        Packet::FriendRequest { sender_alias, .. } => {
+            let _ = handle
+                .notification()
+                .builder()
+                .title("NullPoint: Incoming Request")
+                .body(format!("{} sent you a chat request", sender_alias))
+                .show();
+        }
+        Packet::FriendAccept { sender_alias, .. } => {
+            let _ = handle
+                .notification()
+                .builder()
+                .title("NullPoint: Request Accepted")
+                .body(format!("{} accepted your chat request", sender_alias))
+                .show();
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let handle: AppHandle = app.handle().clone();
 
@@ -212,25 +304,101 @@ pub fn run() {
                         .expect("Failed to bind port 9877"),
                 );
 
-                // Run STUN resolution pool on startup
-                let stun_pool = [
-                    "stun.cloudflare.com:3478",
-                    "stun.l.google.com:19302",
-                    "stun1.l.google.com:19302",
-                    "stun.nextcloud.com:443",
-                ];
-                let resolved_wan = resolve_stun_pool(&main_sock, &stun_pool).await;
+                let filters = Arc::new(RwLock::new(NotificationFilterSettings::default()));
+                let tor_client_holder = Arc::new(RwLock::new(None));
+                let onion_holder = Arc::new(RwLock::new(None));
+
+                // Spawn background Tor bootstrap task
+                let tor_client_clone = tor_client_holder.clone();
+                let _onion_clone = onion_holder.clone();
+                let h_boot = handle.clone();
+                let f_boot = filters.clone();
+                tauri::async_runtime::spawn(async move {
+                    println!("[TOR/ARTI] Initializing Tor client configuration...");
+                    let config = TorClientConfig::default();
+                    match TorClient::create_bootstrapped(config).await {
+                        Ok(client) => {
+                            println!("[TOR/ARTI SUCCESS] Bootstrapped connection to Tor network.");
+                            let client_arc = client.clone();
+                            let mut write_guard = tor_client_clone.write().await;
+                            *write_guard = Some(client.clone());
+
+                            // Launch onion service on virtual port 9876
+                            match client_arc.launch_onion_service(
+                                tor_hsservice::config::OnionServiceConfigBuilder::default()
+                                    .nickname("nullpoint-svc".parse().unwrap())
+                                    .build()
+                                    .unwrap()
+                            ) {
+                                Ok(None) => { eprintln!("[TOR/ARTI ONION] Service launched in dormant mode."); }
+                                Ok(Some((service, mut stream_reqs))) => {
+                                    if let Some(onion_addr) = service.onion_address() {
+                                        let full_str = format!("{}", onion_addr.display_unredacted()).to_lowercase();
+                                        let addr = if full_str.ends_with(".onion") {
+                                            full_str
+                                        } else {
+                                            format!("{}.onion", full_str)
+                                        };
+                                        println!("[TOR/ARTI ONION] Service active at: {}", addr);
+                                        let mut on_guard = _onion_clone.write().await;
+                                        *on_guard = Some(addr);
+                                    }
+
+                                    // Spawn background listener for incoming stream requests
+                                    let h_tor = h_boot.clone();
+                                    let f_tor = f_boot.clone();
+                                    tauri::async_runtime::spawn(async move {
+                                        use futures::StreamExt;
+                                        use tokio::io::AsyncReadExt;
+                                        use tor_cell::relaycell::msg::Connected;
+
+                                        while let Some(rend_req) = stream_reqs.next().await {
+                                            if let Ok(mut stream_requests) = rend_req.accept().await {
+                                                let h_rend = h_tor.clone();
+                                                let f_rend = f_tor.clone();
+                                                tauri::async_runtime::spawn(async move {
+                                                    while let Some(stream_req) = stream_requests.next().await {
+                                                        if let Ok(mut data_stream) = stream_req.accept(Connected::new_empty()).await {
+                                                            let h_stream = h_rend.clone();
+                                                            let f_stream = f_rend.clone();
+                                                            tauri::async_runtime::spawn(async move {
+                                                                let mut buf = vec![0u8; 65535];
+                                                                if let Ok(n) = data_stream.read(&mut buf).await {
+                                                                    if n > 0 {
+                                                                        if let Ok(pkt) = serde_json::from_slice::<Packet>(&buf[..n]) {
+                                                                            trigger_native_notification(&h_stream, &pkt, &f_stream).await;
+                                                                            let _ = h_stream.emit("p2p_message", &pkt);
+                                                                        }
+                                                                    }
+                                                                }
+                                                            });
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    });
+                                }
+                                Err(err) => {
+                                    eprintln!("[TOR/ARTI ONION WARNING] Could not launch hidden service: {}", err);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[TOR/ARTI WARNING] Bootstrap deferred or failed: {}", e);
+                        }
+                    }
+                });
 
                 let s1 = main_sock.clone();
                 let h1 = handle.clone();
+                let f1 = filters.clone();
                 tauri::async_runtime::spawn(async move {
                     let mut buf = vec![0u8; 65535];
                     loop {
                         if let Ok((len, _)) = s1.recv_from(&mut buf).await {
                             if let Ok(pkt) = serde_json::from_slice::<Packet>(&buf[..len]) {
-                                if let Some(w) = h1.get_webview_window("main") {
-                                    let _ = w.emit("p2p_message", &pkt);
-                                }
+                                trigger_native_notification(&h1, &pkt, &f1).await;
                                 let _ = h1.emit("p2p_message", &pkt);
                             }
                         }
@@ -239,14 +407,13 @@ pub fn run() {
 
                 let s2 = peer_sock.clone();
                 let h2 = handle.clone();
+                let f2 = filters.clone();
                 tauri::async_runtime::spawn(async move {
                     let mut buf = vec![0u8; 65535];
                     loop {
                         if let Ok((len, _)) = s2.recv_from(&mut buf).await {
                             if let Ok(pkt) = serde_json::from_slice::<Packet>(&buf[..len]) {
-                                if let Some(w) = h2.get_webview_window("peer") {
-                                    let _ = w.emit("p2p_message", &pkt);
-                                }
+                                trigger_native_notification(&h2, &pkt, &f2).await;
                                 let _ = h2.emit("p2p_message", &pkt);
                             }
                         }
@@ -256,13 +423,21 @@ pub fn run() {
                 app.manage(SocketsState {
                     main_socket: main_sock,
                     peer_socket: peer_sock,
-                    main_wan: Arc::new(tokio::sync::Mutex::new(resolved_wan)),
+                    filters,
+                    tor_client: tor_client_holder,
+                    onion_address: onion_holder,
                 });
             });
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![init_node, send_packet])
+        .invoke_handler(tauri::generate_handler![
+            init_node,
+            send_packet,
+            generate_new_identity,
+            restore_identity_from_key,
+            update_notification_filters
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
