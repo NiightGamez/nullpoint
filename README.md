@@ -1,60 +1,43 @@
 # NullPoint
 
-> Zero-server, zero-uptime-cost, client-to-client (P2P) decentralized chat with cryptographic identity.
-
-NullPoint is a Linux-native messaging client inspired by modern chat platforms. It eliminates central server relays, account databases, and third-party infrastructure. All routing is performed directly between peer instances over UDP using cryptographic public keys and automated STUN NAT traversal.
+NullPoint is a decentralized, serverless peer-to-peer (P2P) communication platform built with **Tauri v2**, **Rust**, and **React**. It eliminates central servers and third-party relay brokers by routing direct, end-to-end encrypted connections over the **Tor network (v3 hidden services)**.
 
 ---
 
-## Architecture & Core Features
+## ⚡ Key Features
 
-- **Decentralized Direct Messaging:** Direct 1:1 packet routing between peer endpoints.
-- **Swarm Mesh Servers:** Multi-user group chat rooms utilizing client-relayed server instances.
-- **Cryptographic Identities:** Local Ed25519 keypair generation with shareable mesh:// URI invites.
-- **Automated STUN NAT Traversal:** Built-in sequential STUN failover pool (Cloudflare, Google, Nextcloud) to automatically discover public WAN endpoints without manual port forwarding.
-- **Desktop Interface:** Discord-inspired dark UI with custom context menus, channel management, and unread badges.
-
----
-
-## Tech Stack
-
-- **Desktop Framework:** Tauri v2
-- **Backend / Networking:** Rust, Tokio (UDP async runtime), ed25519-dalek
-- **Frontend:** React, TypeScript, Tailwind CSS
+* **Serverless P2P Architecture**: Direct node-to-node messaging powered by local socket listeners and background Tor routing.
+* **Tor v3 Hidden Services**: Automated bootstrapping via embedded Arti (`tor-client` / `tor-hsservice`). Every instance hosts an unredacted 56-character `.onion` address for NAT traversal and metadata privacy.
+* **Cryptographic Identity**: Ed25519 keypair generation on first run. Public keys serve as stable, permanent user identifiers without centralized accounts.
+* **Verified Developer Badge**: Native public-key pinning (`VERIFIED_DEV_KEYS`) in the client layer grants cryptographic, unforgeable `[DEV]` badges directly next to verified author messages.
+* **One-Click Shareable Invites**: Generates standard `nullpoint://<pubkey>@<onion>.onion` connection URIs with local fallback routing (`127.0.0.1:9876`).
+* **Lightweight Linux Desktop Client**: Single-window, low-footprint desktop experience packaged as standalone AppImage and Debian packages.
 
 ---
-
-## Getting Started
-
-### System Prerequisites
-
-Install standard WebKitGTK and build tools:
-
-- **Debian / Ubuntu:** sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
-- **Arch Linux:** sudo pacman -S --needed webkit2gtk-4.1 base-devel curl wget openssl gtk3
-
-### Local Development
-
-1. Install dependencies: npm install
-2. Start Vite and dual loopback nodes: npm run tauri dev
-
----
-
-## License
-
-This project is open-source and available under the [GNU Affero General Public License v3 (AGPLv3)](LICENSE).
-
-### Copyleft & Distribution Terms
-- **Source Disclosure:** Any party modifying this software or offering it over a network must provide their complete source code under the identical AGPLv3 license.
-- **Brand Protection:** The "NullPoint" name, logos, and UI assets are proprietary. Independent forks or redistributions must be rebranded and cannot use the official project identity.
 
 ## 🛠️ Roadmap & Known Issues (WIP)
 
-### Up Next / Under Active Development
-- [ ] **Message Persistence**: Store chat history locally via SQLite / local storage so messages don't disappear on restart.
-- [ ] **Peer Discovery / Lobby UX**: Remove hardcoded "Beta Client" fallback (`local:9877`) and route to a neutral lobby / invite prompt.
+### Under Active Development
+- [ ] **Message Persistence**: Store local chat history and direct messages via SQLite / persistent storage across app restarts.
+- [ ] **Lobby & Peer Discovery UX**: Remove hardcoded local testing mock fallbacks (`local:9877` / "Beta Client") and replace with an open room browser / neutral connection lobby.
+- [ ] **Multi-User Swarms**: Extend 1-to-1 hidden service streams into multi-peer group channels.
 
 ### Completed (v0.1.0)
-- [x] Tor v3 Onion address generation (unredacted 56-char base32).
-- [x] Ed25519 identity key pinning & verified `[DEV]` badge.
-- [x] Single-window Linux AppImage distribution.
+- [x] Tor v3 hidden service integration with unredacted `.onion` invite URIs.
+- [x] Ed25519 public-key pinning & verified `[DEV]` badge rendering.
+- [x] Native `sender_pubkey` packet schema contract between Rust and TypeScript.
+- [x] Single-window Linux AppImage and `.deb` distribution builds.
+
+---
+
+## 🚀 Building & Packaging
+
+### Prerequisites
+* **Rust**: `cargo 1.75+`
+* **Node.js**: `v18+` & `npm`
+* **System Libraries**: `libwebkit2gtk-4.1-dev`, `build-essential`, `curl`, `wget`, `file`, `libssl-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`
+
+### Development
+```bash
+npm install
+npm run tauri dev
