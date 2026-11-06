@@ -42,4 +42,8 @@ Install standard WebKitGTK and build tools:
 
 ## License
 
-This project is open-source and available under the [MIT License](LICENSE).
+This project is open-source and available under the [GNU Affero General Public License v3 (AGPLv3)](LICENSE).
+
+### Copyleft & Distribution Terms
+- **Source Disclosure:** Any party modifying this software or offering it over a network must provide their complete source code under the identical AGPLv3 license.
+- **Brand Protection:** The "NullPoint" name, logos, and UI assets are proprietary. Independent forks or redistributions must be rebranded and cannot use the official project identity.
