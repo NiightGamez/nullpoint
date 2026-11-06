@@ -47,3 +47,14 @@ This project is open-source and available under the [GNU Affero General Public L
 ### Copyleft & Distribution Terms
 - **Source Disclosure:** Any party modifying this software or offering it over a network must provide their complete source code under the identical AGPLv3 license.
 - **Brand Protection:** The "NullPoint" name, logos, and UI assets are proprietary. Independent forks or redistributions must be rebranded and cannot use the official project identity.
+
+## 🛠️ Roadmap & Known Issues (WIP)
+
+### Up Next / Under Active Development
+- [ ] **Message Persistence**: Store chat history locally via SQLite / local storage so messages don't disappear on restart.
+- [ ] **Peer Discovery / Lobby UX**: Remove hardcoded "Beta Client" fallback (`local:9877`) and route to a neutral lobby / invite prompt.
+
+### Completed (v0.1.0)
+- [x] Tor v3 Onion address generation (unredacted 56-char base32).
+- [x] Ed25519 identity key pinning & verified `[DEV]` badge.
+- [x] Single-window Linux AppImage distribution.
