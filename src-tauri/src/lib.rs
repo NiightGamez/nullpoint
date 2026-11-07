@@ -137,9 +137,9 @@ async fn init_node(
     let pubkey_str = format!("ed25519_{}", B64.encode(pubkey_bytes));
 
     let (local_port, target_port, alias, target_alias) = if is_peer {
-        (9877, 9876, "Beta Client", "Alpha Host")
+        (9877, 0, "Peer Node", "")
     } else {
-        (9876, 9877, "Alpha Host", "Beta Client")
+        (9876, 0, "mvoorhies", "")
     };
 
     let onion_lock = state.onion_address.read().await;
@@ -186,16 +186,22 @@ async fn send_packet(
             .last()
             .unwrap_or(&target_addr);
 
+        // Direct Tor circuit dispatch across the distributed Tor network
+
         let target_dest = if onion_host.contains(':') {
             onion_host.to_string()
         } else {
             format!("{}:9876", onion_host)
         };
 
+        eprintln!("[TOR DIAL ATTEMPT] Connecting to raw target: {}", target_dest);
         let mut stream = tor_client
-            .connect(target_dest)
+            .connect(&target_dest)
             .await
-            .map_err(|e| format!("Tor circuit connection failed: {}", e))?;
+            .map_err(|e| {
+                eprintln!("[TOR DIAL ERROR DETAILED] {:#?}", e);
+                format!("Tor circuit connection failed: {}", e)
+            })?;
 
         stream
             .write_all(&serialized)
@@ -215,7 +221,8 @@ async fn send_packet(
         let target = if target_addr.contains(':') {
             target_addr
         } else {
-            format!("{}:9876", target_addr)
+            let default_port = if label == "peer" { 9876 } else { 9877 };
+            format!("{}:{}", target_addr, default_port)
         };
 
         socket
@@ -331,7 +338,59 @@ pub fn run() {
                                     .unwrap()
                             ) {
                                 Ok(None) => { eprintln!("[TOR/ARTI ONION] Service launched in dormant mode."); }
-                                Ok(Some((service, mut stream_reqs))) => {
+                                Ok(Some((service, mut rend_requests))) => {
+                                    // Spawn background listener for incoming rendezvous circuits and data streams
+                                    let h_stream = h_boot.clone();
+                                    let f_stream = f_boot.clone();
+                                    tauri::async_runtime::spawn(async move {
+                                        use futures::io::AsyncReadExt;
+                                        use futures::StreamExt;
+                                        use tor_cell::relaycell::msg::Connected;
+
+                                        println!("[TOR/ARTI INBOUND] Listening for incoming rendezvous requests...");
+                                        while let Some(rend_req) = rend_requests.next().await {
+                                            let h = h_stream.clone();
+                                            let f = f_stream.clone();
+
+                                            tauri::async_runtime::spawn(async move {
+                                                match rend_req.accept().await {
+                                                    Ok(mut stream_requests) => {
+                                                        while let Some(stream_req) = stream_requests.next().await {
+                                                            let h_inner = h.clone();
+                                                            let f_inner = f.clone();
+
+                                                            tauri::async_runtime::spawn(async move {
+                                                                match stream_req.accept(Connected::new_empty()).await {
+                                                                    Ok(mut data_stream) => {
+                                                                        let mut buf = Vec::new();
+                                                                        let mut chunk = [0u8; 4096];
+                                                                        loop {
+                                                                            match data_stream.read(&mut chunk).await {
+                                                                                Ok(0) => break,
+                                                                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                                                                                Err(e) => {
+                                                                                    eprintln!("[TOR INBOUND READ ERROR] {}", e);
+                                                                                    break;
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        if let Ok(pkt) = serde_json::from_slice::<Packet>(&buf) {
+                                                                            println!("[TOR INBOUND MSG] Successfully received packet over onion circuit");
+                                                                            trigger_native_notification(&h_inner, &pkt, &f_inner).await;
+                                                                            let _ = h_inner.emit("p2p_message", &pkt);
+                                                                        }
+                                                                    }
+                                                                    Err(e) => eprintln!("[TOR STREAM ACCEPT ERROR] {}", e),
+                                                                }
+                                                            });
+                                                        }
+                                                    }
+                                                    Err(e) => eprintln!("[TOR REND ACCEPTER ERROR] {}", e),
+                                                }
+                                            });
+                                        }
+                                    });
+
                                     if let Some(onion_addr) = service.onion_address() {
                                         let full_str = format!("{}", onion_addr.display_unredacted()).to_lowercase();
                                         let addr = if full_str.ends_with(".onion") {
@@ -340,83 +399,28 @@ pub fn run() {
                                             format!("{}.onion", full_str)
                                         };
                                         println!("[TOR/ARTI ONION] Service active at: {}", addr);
-                                        let mut on_guard = _onion_clone.write().await;
-                                        *on_guard = Some(addr);
-                                    }
-
-                                    // Spawn background listener for incoming stream requests
-                                    let h_tor = h_boot.clone();
-                                    let f_tor = f_boot.clone();
-                                    tauri::async_runtime::spawn(async move {
-                                        use futures::StreamExt;
-                                        use tokio::io::AsyncReadExt;
-                                        use tor_cell::relaycell::msg::Connected;
-
-                                        while let Some(rend_req) = stream_reqs.next().await {
-                                            if let Ok(mut stream_requests) = rend_req.accept().await {
-                                                let h_rend = h_tor.clone();
-                                                let f_rend = f_tor.clone();
-                                                tauri::async_runtime::spawn(async move {
-                                                    while let Some(stream_req) = stream_requests.next().await {
-                                                        if let Ok(mut data_stream) = stream_req.accept(Connected::new_empty()).await {
-                                                            let h_stream = h_rend.clone();
-                                                            let f_stream = f_rend.clone();
-                                                            tauri::async_runtime::spawn(async move {
-                                                                let mut buf = vec![0u8; 65535];
-                                                                if let Ok(n) = data_stream.read(&mut buf).await {
-                                                                    if n > 0 {
-                                                                        if let Ok(pkt) = serde_json::from_slice::<Packet>(&buf[..n]) {
-                                                                            trigger_native_notification(&h_stream, &pkt, &f_stream).await;
-                                                                            let _ = h_stream.emit("p2p_message", &pkt);
-                                                                        }
-                                                                    }
-                                                                }
-                                                            });
-                                                        }
-                                                    }
-                                                });
-                                            }
+                                        {
+                                            let mut on_guard = _onion_clone.write().await;
+                                            *on_guard = Some(addr.clone());
                                         }
-                                    });
-                                }
-                                Err(err) => {
-                                    eprintln!("[TOR/ARTI ONION WARNING] Could not launch hidden service: {}", err);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[TOR/ARTI WARNING] Bootstrap deferred or failed: {}", e);
-                        }
-                    }
-                });
 
-                let s1 = main_sock.clone();
-                let h1 = handle.clone();
-                let f1 = filters.clone();
-                tauri::async_runtime::spawn(async move {
-                    let mut buf = vec![0u8; 65535];
-                    loop {
-                        if let Ok((len, _)) = s1.recv_from(&mut buf).await {
-                            if let Ok(pkt) = serde_json::from_slice::<Packet>(&buf[..len]) {
-                                trigger_native_notification(&h1, &pkt, &f1).await;
-                                let _ = h1.emit("p2p_message", &pkt);
+                                        let mut status_events = service.status_events();
+                                        let h_status = h_boot.clone();
+                                        let addr_ready = addr.clone();
+                                        tauri::async_runtime::spawn(async move {
+                                            use futures::StreamExt;
+                                            while let Some(status) = status_events.next().await {
+                                                println!("[TOR/ARTI STATUS] Onion service status: {:?}", status);
+                                                let _ = h_status.emit("tor_onion_ready", addr_ready.clone());
+                                                break;
+                                            }
+                                        });
+                                    }
+                                }
+                                Err(e) => eprintln!("[TOR/ARTI ONION ERROR] Failed to launch onion service: {}", e),
                             }
                         }
-                    }
-                });
-
-                let s2 = peer_sock.clone();
-                let h2 = handle.clone();
-                let f2 = filters.clone();
-                tauri::async_runtime::spawn(async move {
-                    let mut buf = vec![0u8; 65535];
-                    loop {
-                        if let Ok((len, _)) = s2.recv_from(&mut buf).await {
-                            if let Ok(pkt) = serde_json::from_slice::<Packet>(&buf[..len]) {
-                                trigger_native_notification(&h2, &pkt, &f2).await;
-                                let _ = h2.emit("p2p_message", &pkt);
-                            }
-                        }
+                        Err(e) => eprintln!("[TOR/ARTI BOOT ERROR] Failed: {}", e),
                     }
                 });
 
