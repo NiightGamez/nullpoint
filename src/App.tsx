@@ -59,6 +59,20 @@ interface StoredAccount {
   username: string;
   secret_key: string;
   pubkey: string;
+  account_tag?: string;
+}
+
+interface VaultProfile {
+  username: string;
+  public_key: string;
+  account_tag: string;
+  created_at: number;
+}
+
+interface CreatedVaultResult {
+  profile: VaultProfile;
+  recovery_phrase: string;
+  recovery_kit_uri: string;
 }
 
 interface Contact {
@@ -123,10 +137,21 @@ export default function App() {
 
   const [toasts, setToasts] = useState<InAppToast[]>([]);
   const [showAuthModal, setShowAuthModal] = useState<boolean>(false);
-  const [authTab, setAuthTab] = useState<"new" | "import">("new");
+  const [authTab, setAuthTab] = useState<"unlock" | "new" | "import">("new");
+  const [existingProfile, setExistingProfile] = useState<VaultProfile | null>(null);
   const [usernameInput, setUsernameInput] = useState("");
+  const [passwordInput, setPasswordInput] = useState("");
+  const [confirmPasswordInput, setConfirmPasswordInput] = useState("");
   const [secretKeyInput, setSecretKeyInput] = useState("");
+  const [recoveryPasswordInput, setRecoveryPasswordInput] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
+  const [rememberOnDevice, setRememberOnDevice] = useState(false);
+  const [tempSignupSecret, setTempSignupSecret] = useState("");
+  const [pmSaveStatus, setPmSaveStatus] = useState<string | null>(null);
+  const [newRecoveryKit, setNewRecoveryKit] = useState<CreatedVaultResult | null>(null);
+  const [savedBackupPath, setSavedBackupPath] = useState<string | null>(null);
+  const [showPhraseWords, setShowPhraseWords] = useState(false);
   const [showExportModal, setShowExportModal] = useState(false);
 
   // Navigation: "deck" (home telemetry dashboard), "dm" (direct peer stream), "server" (swarm channel)
@@ -169,18 +194,40 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, navMode, activeContact, activeChannel]);
 
-  // Load saved account & contacts from localStorage
+  // Check encrypted Rust SQLite vault on boot
   useEffect(() => {
-    const raw = localStorage.getItem("nullpoint_account");
-    if (raw) {
-      try {
-        setAccount(JSON.parse(raw));
-      } catch {
-        setShowAuthModal(true);
+    const bootVault = async () => {
+      if (isTauri) {
+        try {
+          const autoUnlocked = await invoke<VaultProfile | null>("try_keyring_auto_unlock");
+          if (autoUnlocked) {
+            setAccount({
+              username: autoUnlocked.username,
+              secret_key: "[LOCKED_IN_RUST_VAULT]",
+              pubkey: autoUnlocked.public_key.startsWith("ed25519_")
+                ? autoUnlocked.public_key
+                : `ed25519_${autoUnlocked.public_key}`,
+              account_tag: autoUnlocked.account_tag,
+            });
+            setShowAuthModal(false);
+            return;
+          }
+          const found = await invoke<VaultProfile | null>("check_local_account");
+          if (found) {
+            setExistingProfile(found);
+            setUsernameInput(found.username);
+            setAuthTab("unlock");
+            setShowAuthModal(true);
+            return;
+          }
+        } catch (err) {
+          console.error("Vault check failed:", err);
+        }
       }
-    } else {
+      setAuthTab("new");
       setShowAuthModal(true);
-    }
+    };
+    bootVault();
 
     const savedContacts = localStorage.getItem("nullpoint_contacts");
     if (savedContacts) {
@@ -263,7 +310,6 @@ export default function App() {
             const check = await invoke<NodeIdentity>("init_node");
             if (check.onion_address) {
               updateOnionState(check.onion_address);
-              clearInterval(onionPoll);
             }
           } catch (_) {}
         }, 1500);
@@ -322,7 +368,7 @@ export default function App() {
               const exists = prev.some(
                 (c) => c.pubkey === packet.sender_pubkey || (!c.pubkey && c.alias === packet.sender_alias)
               );
-              const senderAddr = packet.sender_addr || (window.__TAURI_INTERNALS__ ? "127.0.0.1:9877" : "");
+              const senderAddr = packet.sender_addr || ((window as any).__TAURI_INTERNALS__ ? "127.0.0.1:9877" : "");
               if (exists) {
                 return prev.map((c) =>
                   !c.pubkey || c.pubkey === packet.sender_pubkey
@@ -395,115 +441,151 @@ export default function App() {
     init();
     return () => {
       if (cleanup) cleanup();
-      unlistenTor();
-      clearInterval(onionPoll);
     };
   }, [account]);
+
+  const handleUnlockAccount = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError("");
+    if (!passwordInput) return;
+    setAuthBusy(true);
+    try {
+      const profile = await invoke<VaultProfile>("unlock_vault_account", {
+        password: passwordInput,
+      });
+      await invoke("set_keyring_remember", {
+        username: profile.username,
+        password: passwordInput,
+        remember: rememberOnDevice,
+      });
+      setAccount({
+        username: profile.username,
+        secret_key: "[LOCKED_IN_RUST_VAULT]",
+        pubkey: profile.public_key.startsWith("ed25519_")
+          ? profile.public_key
+          : `ed25519_${profile.public_key}`,
+        account_tag: profile.account_tag,
+      });
+      setPasswordInput("");
+      setShowAuthModal(false);
+    } catch (err: any) {
+      setAuthError(err.toString());
+    } finally {
+      setAuthBusy(false);
+    }
+  };
 
   const handleCreateAccount = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError("");
     if (!usernameInput.trim()) return;
+    if (passwordInput.length < 10) {
+      setAuthError("Master password must be at least 10 characters.");
+      return;
+    }
+    if (passwordInput !== confirmPasswordInput) {
+      setAuthError("Passwords do not match.");
+      return;
+    }
 
+    setAuthBusy(true);
     try {
-      const gen = await invoke<{ secret_key: string; pubkey: string }>("generate_new_identity");
-      const acc = {
+      const created = await invoke<CreatedVaultResult>("create_vault_account", {
         username: usernameInput.trim(),
-        secret_key: gen.secret_key,
-        pubkey: gen.pubkey,
+        password: passwordInput,
+      });
+      await invoke("set_keyring_remember", {
+        username: created.profile.username,
+        password: passwordInput,
+        remember: rememberOnDevice,
+      });
+      setTempSignupSecret(passwordInput);
+      const acc: StoredAccount = {
+        username: created.profile.username,
+        secret_key: "[LOCKED_IN_RUST_VAULT]",
+        pubkey: created.profile.public_key.startsWith("ed25519_")
+          ? created.profile.public_key
+          : `ed25519_${created.profile.public_key}`,
+        account_tag: created.profile.account_tag,
       };
-      localStorage.setItem("nullpoint_account", JSON.stringify(acc));
       setAccount(acc);
+      setNewRecoveryKit(created);
+      setPasswordInput("");
+      setConfirmPasswordInput("");
       setShowAuthModal(false);
     } catch (err: any) {
       setAuthError(err.toString());
+    } finally {
+      setAuthBusy(false);
     }
   };
 
   const handleImportAccount = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError("");
-    if (!usernameInput.trim() || !secretKeyInput.trim()) return;
-
-    const rawKey = secretKeyInput.trim();
-    if (rawKey.includes("dsAtuLsqvCN2DcEKPrVNfSt5rGx0xAFUq6fDKNs0G3M")) {
-      const acc = {
-        username: usernameInput.trim() || "mvoorhies",
-        secret_key: "pinned_dev_seed",
-        pubkey: "ed25519_dsAtuLsqvCN2DcEKPrVNfSt5rGx0xAFUq6fDKNs0G3M=",
-      };
-      localStorage.setItem("nullpoint_account", JSON.stringify(acc));
-      setAccount(acc);
-      setShowAuthModal(false);
+    if (!secretKeyInput.trim() || !passwordInput) return;
+    if (passwordInput.length < 10) {
+      setAuthError("New local master password must be at least 10 characters.");
       return;
     }
 
+    setAuthBusy(true);
     try {
-      let cleanSecret = rawKey
-        .replace(/^ed25519_sk_/i, "")
-        .replace(/^ed25519_/i, "");
-      while (cleanSecret.length % 4 !== 0) {
-        cleanSecret += "=";
-      }
-      const res = await invoke<{ secret_key: string; pubkey: string }>(
-        "restore_identity_from_key",
-        { secretB64: cleanSecret }
-      );
-      const acc = {
-        username: usernameInput.trim(),
-        secret_key: res.secret_key,
-        pubkey: res.pubkey,
-      };
-      localStorage.setItem("nullpoint_account", JSON.stringify(acc));
-      setAccount(acc);
+      const profile = await invoke<VaultProfile>("recover_vault_account", {
+        recoveryInput: secretKeyInput.trim(),
+        recoveryPassword: recoveryPasswordInput || passwordInput,
+        newLocalPassword: passwordInput,
+        overrideUsername: usernameInput.trim() ? usernameInput.trim() : null,
+      });
+      setAccount({
+        username: profile.username,
+        secret_key: "[LOCKED_IN_RUST_VAULT]",
+        pubkey: profile.public_key.startsWith("ed25519_")
+          ? profile.public_key
+          : `ed25519_${profile.public_key}`,
+        account_tag: profile.account_tag,
+      });
+      setSecretKeyInput("");
+      setRecoveryPasswordInput("");
+      setPasswordInput("");
       setShowAuthModal(false);
     } catch (err: any) {
       setAuthError(err.toString());
+    } finally {
+      setAuthBusy(false);
     }
   };
 
-  const parseInviteUri = (raw: string) => {
-    const clean = raw
-      .trim()
-      .replace(/^nullpoint:\/\//i, "")
-      .replace(/^mesh:\/\//i, "");
-    if (clean.includes("@")) {
-      const [pub, addr] = clean.split("@");
-      return { targetPubkey: pub.trim(), targetAddr: addr.trim() };
-    }
-    return { targetPubkey: "", targetAddr: clean };
-  };
-
-  const parseAndAddInvite = async (e: React.FormEvent) => {
+  const parseAndAddInvite = (e: React.FormEvent) => {
     e.preventDefault();
     if (!inviteInput.trim()) return;
+    let targetPubkey = "";
+    let targetAddr = "";
+    let alias = manualAlias.trim() || "Peer Node";
 
-    const { targetPubkey, targetAddr } = parseInviteUri(inviteInput);
-    if (!targetAddr) return;
+    const clean = inviteInput.trim().replace(/^nullpoint:\/\//, "");
+    if (clean.includes("@")) {
+      const [pub, addr] = clean.split("@");
+      targetPubkey = pub;
+      targetAddr = addr;
+    } else if (clean.includes(":")) {
+      targetAddr = clean;
+      targetPubkey = `peer_${clean.replace(/[^a-zA-Z0-9]/g, "")}`;
+    } else {
+      targetPubkey = clean;
+      targetAddr = "127.0.0.1:9877";
+    }
 
-    const shortAddr = targetAddr.endsWith(".onion")
-      ? `${targetAddr.slice(0, 10)}...onion`
-      : targetAddr;
-
-    const newContact: Contact = {
-      alias: manualAlias.trim() || `Peer [${shortAddr}]`,
-      pubkey: targetPubkey,
-      addr: targetAddr,
-    };
-
-    setContacts((prev) => [...prev.filter((c) => c.addr !== targetAddr), newContact]);
+    const newContact: Contact = { alias, pubkey: targetPubkey, addr: targetAddr };
+    setContacts((prev) => {
+      if (prev.some((c) => c.pubkey === newContact.pubkey)) return prev;
+      return [...prev, newContact];
+    });
     setActiveContact(newContact);
     setNavMode("dm");
     setInviteInput("");
     setManualAlias("");
     setShowAddContactModal(false);
-
-    // Also add peer to active swarm relay list so swarm broadcasts reach them
-    setServers((prev) =>
-      prev.map((s) =>
-        s.peers.includes(targetAddr) ? s : { ...s, peers: [...s.peers, targetAddr] }
-      )
-    );
   };
 
   const handleAcceptRequest = async (req: FriendRequestPacket) => {
@@ -558,7 +640,6 @@ export default function App() {
         id: messageId,
         sender_pubkey: identity.pubkey,
         sender_alias: identity.alias,
-        sender_addr: identity.shareable_invite || (window.__TAURI_INTERNALS__ ? "127.0.0.1:9876" : ""),
         recipient_pubkey: activeContact.pubkey || "pending",
         text: inputText,
         timestamp: time,
@@ -1476,39 +1557,70 @@ export default function App() {
         </div>
       )}
 
-      {/* MODAL: INITIALIZE OR IMPORT CRYPTOGRAPHIC IDENTITY */}
+      {/* MODAL: ENCRYPTED VAULT UNLOCK / SIGNUP / RECOVERY */}
       {showAuthModal && (
-        <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-center justify-center p-4">
+        <div className="fixed inset-0 z-50 bg-black/90 backdrop-blur-md flex items-center justify-center p-4">
           <div className="w-full max-w-md p-6 rounded-xl bg-[#0b0e15] border border-cyan-500/30 shadow-2xl space-y-5 font-mono">
             <div>
               <div className="text-[10px] text-cyan-400 uppercase tracking-widest">
-                // INITIALIZE NODE IDENTITY
+                // ARGON2ID + CHACHA20-POLY1305 VAULT
               </div>
-              <h2 className="text-lg font-bold text-white mt-1">NULLPOINT KEYPAIR VAULT</h2>
+              <h2 className="text-lg font-bold text-white mt-1">
+                {authTab === "unlock"
+                  ? "UNLOCK NULLPOINT"
+                  : authTab === "new"
+                  ? "CREATE ACCOUNT"
+                  : "RECOVER ACCOUNT"}
+              </h2>
+              <p className="text-[11px] text-slate-400 mt-1">
+                Zero central servers. Your password encrypts your private signing key locally and works with any password manager.
+              </p>
             </div>
 
             <div className="flex gap-2 border-b border-white/[0.08] pb-2">
+              {existingProfile && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthError("");
+                    setAuthTab("unlock");
+                  }}
+                  className={`px-3 py-1 rounded text-xs uppercase cursor-pointer ${
+                    authTab === "unlock"
+                      ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40"
+                      : "text-slate-400"
+                  }`}
+                >
+                  UNLOCK
+                </button>
+              )}
               <button
                 type="button"
-                onClick={() => setAuthTab("new")}
+                onClick={() => {
+                  setAuthError("");
+                  setAuthTab("new");
+                }}
                 className={`px-3 py-1 rounded text-xs uppercase cursor-pointer ${
                   authTab === "new"
                     ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40"
                     : "text-slate-400"
                 }`}
               >
-                GENERATE NEW KEY
+                NEW ACCOUNT
               </button>
               <button
                 type="button"
-                onClick={() => setAuthTab("import")}
+                onClick={() => {
+                  setAuthError("");
+                  setAuthTab("import");
+                }}
                 className={`px-3 py-1 rounded text-xs uppercase cursor-pointer ${
                   authTab === "import"
                     ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40"
                     : "text-slate-400"
                 }`}
               >
-                RESTORE SEED
+                RECOVER
               </button>
             </div>
 
@@ -1518,47 +1630,313 @@ export default function App() {
               </div>
             )}
 
-            <form
-              onSubmit={authTab === "new" ? handleCreateAccount : handleImportAccount}
-              className="space-y-3"
-            >
-              <div>
-                <label className="text-[10px] text-slate-400 uppercase block mb-1">
-                  OPERATOR CALLSIGN
-                </label>
+            {authTab === "unlock" && existingProfile && (
+              <form onSubmit={handleUnlockAccount} className="space-y-3">
+                <div className="p-3 rounded bg-black/50 border border-white/[0.08]">
+                  <div className="text-[10px] text-slate-400 uppercase">LOCAL IDENTITY</div>
+                  <div className="text-sm font-bold text-cyan-300 mt-0.5">
+                    {existingProfile.account_tag}
+                  </div>
+                </div>
                 <input
                   type="text"
-                  value={usernameInput}
-                  onChange={(e) => setUsernameInput(e.target.value)}
-                  placeholder="mvoorhies"
-                  className="w-full px-3 py-2 rounded bg-black/60 border border-white/[0.12] text-xs text-white"
-                  required
+                  name="username"
+                  autoComplete="username"
+                  value={existingProfile.username}
+                  readOnly
+                  className="hidden"
                 />
-              </div>
-
-              {authTab === "import" && (
                 <div>
                   <label className="text-[10px] text-slate-400 uppercase block mb-1">
-                    ED25519 SECRET KEY (BASE64)
+                    MASTER PASSWORD
                   </label>
                   <input
                     type="password"
+                    name="password"
+                    autoComplete="current-password"
+                    value={passwordInput}
+                    onChange={(e) => setPasswordInput(e.target.value)}
+                    placeholder="Enter master password (or auto-fill)..."
+                    className="w-full px-3 py-2 rounded bg-black/60 border border-white/[0.12] text-xs text-white"
+                    required
+                    autoFocus
+                  />
+                </div>
+                <label className="flex items-center gap-2 text-[11px] text-slate-300 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={rememberOnDevice}
+                    onChange={(e) => setRememberOnDevice(e.target.checked)}
+                    className="accent-cyan-400"
+                  />
+                  Keep me signed in on this PC (OS Keyring)
+                </label>
+                <button
+                  type="submit"
+                  disabled={authBusy}
+                  className="w-full py-2.5 rounded bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 text-slate-950 font-bold text-xs uppercase tracking-wider cursor-pointer"
+                >
+                  {authBusy ? "DERIVING KEY (ARGON2ID)..." : "UNLOCK VAULT"}
+                </button>
+              </form>
+            )}
+
+            {authTab === "new" && (
+              <form onSubmit={handleCreateAccount} className="space-y-3">
+                <div>
+                  <label className="text-[10px] text-slate-400 uppercase block mb-1">
+                    USERNAME
+                  </label>
+                  <input
+                    type="text"
+                    name="username"
+                    autoComplete="username"
+                    value={usernameInput}
+                    onChange={(e) => setUsernameInput(e.target.value)}
+                    placeholder="mvoorhies"
+                    className="w-full px-3 py-2 rounded bg-black/60 border border-white/[0.12] text-xs text-white"
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] text-slate-400 uppercase block mb-1">
+                    MASTER PASSWORD (MIN 10 CHARS)
+                  </label>
+                  <input
+                    type="password"
+                    name="new-password"
+                    autoComplete="new-password"
+                    value={passwordInput}
+                    onChange={(e) => setPasswordInput(e.target.value)}
+                    placeholder="Use a password manager to generate..."
+                    className="w-full px-3 py-2 rounded bg-black/60 border border-white/[0.12] text-xs text-white"
+                    minLength={10}
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] text-slate-400 uppercase block mb-1">
+                    CONFIRM MASTER PASSWORD
+                  </label>
+                  <input
+                    type="password"
+                    name="confirm-password"
+                    autoComplete="new-password"
+                    value={confirmPasswordInput}
+                    onChange={(e) => setConfirmPasswordInput(e.target.value)}
+                    placeholder="Repeat password..."
+                    className="w-full px-3 py-2 rounded bg-black/60 border border-white/[0.12] text-xs text-white"
+                    minLength={10}
+                    required
+                  />
+                </div>
+                <label className="flex items-center gap-2 text-[11px] text-slate-300 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={rememberOnDevice}
+                    onChange={(e) => setRememberOnDevice(e.target.checked)}
+                    className="accent-cyan-400"
+                  />
+                  Keep me signed in on this PC (OS Keyring)
+                </label>
+                <button
+                  type="submit"
+                  disabled={authBusy}
+                  className="w-full py-2.5 rounded bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 text-slate-950 font-bold text-xs uppercase tracking-wider cursor-pointer"
+                >
+                  {authBusy ? "ENCRYPTING VAULT..." : "CREATE ENCRYPTED ACCOUNT"}
+                </button>
+              </form>
+            )}
+
+            {authTab === "import" && (
+              <form onSubmit={handleImportAccount} className="space-y-3">
+                <div>
+                  <label className="text-[10px] text-slate-400 uppercase block mb-1">
+                    RECOVERY KIT URI OR 12-WORD PHRASE
+                  </label>
+                  <textarea
                     value={secretKeyInput}
                     onChange={(e) => setSecretKeyInput(e.target.value)}
-                    placeholder="Paste base64 secret key seed..."
+                    placeholder="Paste nullpoint-recovery://... token or 12 recovery words..."
+                    rows={3}
                     className="w-full px-3 py-2 rounded bg-black/60 border border-white/[0.12] text-xs text-cyan-300"
                     required
                   />
                 </div>
-              )}
+                {secretKeyInput.trim().startsWith("nullpoint-recovery://") && (
+                  <div>
+                    <label className="text-[10px] text-slate-400 uppercase block mb-1">
+                      ORIGINAL RECOVERY PASSWORD
+                    </label>
+                    <input
+                      type="password"
+                      value={recoveryPasswordInput}
+                      onChange={(e) => setRecoveryPasswordInput(e.target.value)}
+                      placeholder="Password that encrypted this recovery kit..."
+                      className="w-full px-3 py-2 rounded bg-black/60 border border-white/[0.12] text-xs text-white"
+                      required
+                    />
+                  </div>
+                )}
+                <div>
+                  <label className="text-[10px] text-slate-400 uppercase block mb-1">
+                    DISPLAY USERNAME (OPTIONAL)
+                  </label>
+                  <input
+                    type="text"
+                    name="username"
+                    autoComplete="username"
+                    value={usernameInput}
+                    onChange={(e) => setUsernameInput(e.target.value)}
+                    placeholder="Leave blank to keep original username"
+                    className="w-full px-3 py-2 rounded bg-black/60 border border-white/[0.12] text-xs text-white"
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] text-slate-400 uppercase block mb-1">
+                    NEW LOCAL MASTER PASSWORD (MIN 10 CHARS)
+                  </label>
+                  <input
+                    type="password"
+                    name="new-password"
+                    autoComplete="new-password"
+                    value={passwordInput}
+                    onChange={(e) => setPasswordInput(e.target.value)}
+                    placeholder="Set password for this device..."
+                    className="w-full px-3 py-2 rounded bg-black/60 border border-white/[0.12] text-xs text-white"
+                    minLength={10}
+                    required
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={authBusy}
+                  className="w-full py-2.5 rounded bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 text-slate-950 font-bold text-xs uppercase tracking-wider cursor-pointer"
+                >
+                  {authBusy ? "RESTORING IDENTITY..." : "RESTORE & LOCK VAULT"}
+                </button>
+              </form>
+            )}
+          </div>
+        </div>
+      )}
 
-              <button
-                type="submit"
-                className="w-full py-2.5 rounded bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs uppercase tracking-wider cursor-pointer"
-              >
-                {authTab === "new" ? "MINT ED25519 IDENTITY" : "RESTORE CRYPTOGRAPHIC NODE"}
-              </button>
-            </form>
+      {/* MODAL: POST-SIGNUP 3-TIER BACKUP KIT (HARD TO LOSE, HARD TO HACK) */}
+      {newRecoveryKit && (
+        <div className="fixed inset-0 z-50 bg-black/90 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="w-full max-w-lg p-6 rounded-xl bg-[#0b0e15] border border-emerald-500/40 shadow-2xl space-y-4 font-mono">
+            <div>
+              <div className="text-[10px] text-emerald-400 uppercase tracking-widest">
+                // ACCOUNT ENCRYPTED & READY
+              </div>
+              <h2 className="text-lg font-bold text-white mt-1">
+                SAVE YOUR RECOVERY BACKUP ({newRecoveryKit.profile.account_tag})
+              </h2>
+              <p className="text-xs text-slate-300 mt-1">
+                Because NullPoint has no central servers, nobody can reset your password for you. Save at least one backup below so you never lose your account:
+              </p>
+            </div>
+
+            <div className="space-y-3">
+              <div className="p-3 rounded bg-black/60 border border-white/[0.1] space-y-2">
+                <div className="text-xs font-bold text-cyan-300">
+                  1. Encrypted .npkey File (Safe for Cloud / USB)
+                </div>
+                <p className="text-[11px] text-slate-400">
+                  Encrypted with Argon2id + ChaCha20-Poly1305. Useless to anyone without your master password.
+                </p>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const saved = await invoke<string>("save_npkey_backup", {
+                        username: newRecoveryKit.profile.username,
+                        recoveryKitUri: newRecoveryKit.recovery_kit_uri,
+                      });
+                      setSavedBackupPath(saved);
+                    } catch (e: any) {
+                      alert(e.toString());
+                    }
+                  }}
+                  className="px-3 py-1.5 rounded bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/40 text-cyan-300 text-xs cursor-pointer"
+                >
+                  {savedBackupPath ? `SAVED: ${savedBackupPath}` : "SAVE .NPKEY BACKUP TO DOCUMENTS"}
+                </button>
+              </div>
+
+              <div className="p-3 rounded bg-cyan-950/30 border border-cyan-500/40 space-y-2">
+                <div className="text-xs font-bold text-cyan-300">
+                  2. 1-Click Save to Password Manager (1Password / Bitwarden / KeePassXC)
+                </div>
+                <p className="text-[11px] text-slate-300">
+                  Saves directly to 1Password (if CLI is active) or exports a 1-click import CSV containing your username, password, and encrypted recovery kit.
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        const res = await invoke<string>("save_to_password_manager", {
+                          username: newRecoveryKit.profile.username,
+                          accountTag: newRecoveryKit.profile.account_tag,
+                          password: tempSignupSecret,
+                          recoveryKitUri: newRecoveryKit.recovery_kit_uri,
+                        });
+                        setPmSaveStatus(
+                          res === "1PASSWORD_DIRECT"
+                            ? "SAVED DIRECTLY TO 1PASSWORD"
+                            : `EXPORTED CSV: ${res} (Import & delete file)`
+                        );
+                      } catch (e: any) {
+                        alert(e.toString());
+                      }
+                    }}
+                    className="px-3 py-1.5 rounded bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs cursor-pointer"
+                  >
+                    {pmSaveStatus ? pmSaveStatus : "1-CLICK SAVE TO PASSWORD MANAGER"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText(newRecoveryKit.recovery_kit_uri);
+                      setPmSaveStatus("COPIED RECOVERY TOKEN TO CLIPBOARD");
+                    }}
+                    className="px-3 py-1.5 rounded bg-white/10 hover:bg-white/15 border border-white/15 text-white text-xs cursor-pointer"
+                  >
+                    COPY TOKEN ONLY
+                  </button>
+                </div>
+              </div>
+
+              <div className="p-3 rounded bg-black/60 border border-white/[0.1] space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-amber-300">
+                    3. Offline 12-Word Master Phrase
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setShowPhraseWords(!showPhraseWords)}
+                    className="text-[11px] text-amber-400 underline cursor-pointer"
+                  >
+                    {showPhraseWords ? "HIDE WORDS" : "REVEAL WORDS"}
+                  </button>
+                </div>
+                {showPhraseWords && (
+                  <div className="p-2.5 rounded bg-amber-500/10 border border-amber-500/30 text-xs text-amber-200 select-all">
+                    {newRecoveryKit.recovery_phrase}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => { setTempSignupSecret(""); setPmSaveStatus(null); setNewRecoveryKit(null); }}
+              className="w-full py-2.5 rounded bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs uppercase tracking-wider cursor-pointer"
+            >
+              I HAVE SAVED MY BACKUP — ENTER NULLPOINT
+            </button>
           </div>
         </div>
       )}
