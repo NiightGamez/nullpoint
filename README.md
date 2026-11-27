@@ -1,126 +1,62 @@
 # NullPoint
 
-NullPoint is a zero-trust, metadata-resistant communication platform and sovereign cyberdeck terminal built with **Tauri v2**, **Rust**, and **React**. It eliminates central servers and third-party relay brokers by routing direct, end-to-end encrypted connections over the **Tor network (v3 hidden services)** with support for optional self-hosted community nodes ("Decks").
+> Zero-server, zero-uptime-cost, client-to-client (P2P) decentralized chat and voice/video platform with local cryptographic accounts.
+
+NullPoint is a Linux-native decentralized communication client inspired by Discord and TeamSpeak. It eliminates central account databases, mandatory dedicated servers, and third-party relays—combining an **Argon2id + ChaCha20-Poly1305 encrypted local identity vault** with embedded **Tor v3 (`arti`)** for private 1:1 Direct Messages and **QUIC P2P (`iroh`)** for low-latency community Servers, voice, video, and screen sharing.
 
 ---
 
-## 🤖 AI-Assisted Architecture & "Vibe Coding" Transparency
+## Architecture & Core Features
 
-NullPoint was designed, scaffolded, and implemented using **AI pair-programming and vibe coding workflows** (collaborating with large language models to architect systems, debug compiler errors, and navigate bleeding-edge Rust crates). 
-
-While AI generated substantial portions of the boilerplate, integration logic, and interface scaffolding, every component—from Arti's nested circuit streams to cryptographic Ed25519 identity schemes and SQLite transaction layers—is actively reviewed, tested, hardened, and maintained by human engineering. This repository stands as a transparent showcase of what modern human-in-the-loop AI software engineering can achieve when pushing unstable, cutting-edge protocol stacks.
-
----
-
-## 🤝 Community & Contributions
-
-Contributions, bug reports, and discussions from other developers and tinkerers are welcome! 
-
-Whether you want to optimize Tor circuit stream handling, refine the SQLite persistence layer, or enhance the React cyberdeck frontend, pull requests and issues are encouraged. Note that all proposed contributions, architectural changes, and feature merges will be reviewed and approved at my discretion to maintain the project's core vision, security model, and sovereign UX aesthetic.
+- **Zero-Server Encrypted Account Vault (`vault.db`):**
+  - Accounts are backed locally by an Ed25519 master keypair encrypted at rest via **Argon2id** key derivation and **ChaCha20-Poly1305** authenticated encryption (`rusqlite` bundled SQLite).
+  - **Hard to Lose, Hard to Hack:** Includes a 3-tier backup system—encrypted portable `.npkey` recovery files (safe for cloud/USB storage), **1-click Password Manager save/export** (direct 1Password CLI `op` creation or universal Bitwarden/1Password/KeePassXC `.csv` import), and an offline 12-word BIP39 recovery phrase—plus optional opt-in OS Keyring auto-unlock (`keyring`).
+- **Embedded Tor v3 Engine (`arti-client`):** Native Rust Tor runtime bootstrapping in-process with zero external daemons for IP-private 1:1 Direct Messages over `.onion` rendezvous circuits.
+- **Obsidian Cyberdeck UI:** Single-window Tauri v2 + React + TypeScript interface with live circuit telemetry, custom context menus, and verified Ed25519 `[DEV]` badge pinning.
 
 ---
 
-## 🏗️ Architecture & Topology
+## Tech Stack
 
-NullPoint balances direct, sovereign peer-to-peer circuits with personal self-hosted nodes to support asynchronous offline messaging and group rooms without centralized infrastructure:
-
-```text
-                  ┌────────────────────────┐
-                  │    NullPoint Client    │
-                  │  (Obsidian Cyberdeck)  │
-                  └───────────┬────────────┘
-                              │ Tauri IPC
-                  ┌───────────▼────────────┐
-                  │      Rust Backend      │
-                  │   (Arti + HS + SQLite) │
-                  └─────┬────────────┬─────┘
-       Direct 1:1 Dial  │            │  Relay / Channel Subscription
-                        ▼            ▼
-         [ Peer Client Node ]       [ Self-Hosted "Deck" Node ]
-          (Live Ephemeral DM)        (24/7 Headless Room & Mailbox)
-```
+- **Desktop Framework:** Tauri v2
+- **Backend & Cryptography:** Rust, Tokio, `arti-client` (Tor v3), `ed25519-dalek`, `argon2`, `chacha20poly1305`, `bip39`, `rusqlite` (bundled), `keyring`
+- **Frontend:** React, TypeScript, Tailwind CSS
 
 ---
 
-## ⚡ Key Features
+## Milestone Status & Roadmap (v0.2.0)
 
-* **Serverless P2P Architecture:** Direct node-to-node messaging powered by embedded background Tor routing.
-* **Native Embedded Tor v3 Services:** Automated bootstrapping via embedded Arti (`arti-client` / `tor-hsservice` v0.47). Every instance runs an unredacted 56-character `.onion` hidden service for NAT traversal and metadata privacy.
-* **Cryptographic Identity Layer:** Ed25519 keypair generation and verification. Public keys serve as permanent, cryptographic user identifiers.
-* **Deterministic Addressing:** One-click shareable connection URIs formatted as `nullpoint://<ed25519_pubkey>@<hsid>.onion`.
-* **Two-Tier Rendezvous Acceptor:** Custom nested inbound listener handling `RendezvousRequest` down to `StreamRequest` with `Connected` relay cells.
-* **Obsidian Cyberdeck Interface:** Monospace desktop layout with tactile circuit telemetry, real-time event monitoring (`tor_onion_ready`), and single-instance window layout.
+### Completed
+- [x] **Encrypted Local Account Vault:** Argon2id + ChaCha20-Poly1305 SQLite vault (`vault.db`) with password-manager-friendly signup, unlock, and recovery.
+- [x] **3-Tier Account Recovery & 1-Click Password Manager Export:** Portable `.npkey` encrypted backups, 1Password CLI / universal CSV password manager export, 12-word BIP39 recovery phrase, and opt-in OS Keyring auto-unlock.
+- [x] **Standalone Embedded Tor Engine:** Native Rust Arti v0.47 integration bootstrapping in RAM and publishing unredacted 56-character `.onion` hidden service addresses.
+- [x] **Two-Tier Inbound Rendezvous Listener:** Nested stream negotiation yielding bidirectional `DataStream` sockets.
+- [x] **Obsidian Cyberdeck UI:** Single-window desktop layout, live circuit telemetry indicators, and verified `[DEV]` badge pinning.
 
----
-
-## 🛠️ Tech Stack
-
-* **Desktop Framework:** Tauri v2
-* **Backend Runtime:** Rust, Tokio (async runtime), `arti-client` (v0.47), `tor-hsservice` (v0.47), `tor-cell` (v0.47)
-* **Cryptography & Data:** `ed25519-dalek`, `rusqlite` (bundled SQLite persistence)
-* **Frontend:** React, TypeScript, Tailwind CSS
+### Active Backlog (Next Sprints)
+- [ ] **SQLite Message & Contact Persistence:** Wire DMs, contacts, and an offline outbox queue into `vault.db` so chat history persists across restarts.
+- [ ] **Transport Framing & Live 2-Node Tor DM Verification:** Add length-prefixed framing (`u32` + JSON) over Arti streams and verify live 1:1 DMs across two nodes.
+- [ ] **Self-Hosted / Client-Hosted Servers (`iroh` QUIC P2P):** Multi-channel Discord/TeamSpeak-style rooms with client host toggle, `--headless` daemon mode, and capped SQLite ring buffers.
+- [ ] **E2EE Voice, Video & Screen Sharing:** Low-latency peer-to-peer audio, video, and screen streaming over authenticated QUIC channels.
 
 ---
 
-## 🗺️ Milestone Status & Roadmap
-
-### Completed Milestones
-- [x] **Standalone Embedded Tor Engine:** Native Rust Arti integration running directly in-process without external Tor daemon/SOCKS proxies.
-- [x] **Cryptographic Identity Schema:** Ed25519 keypair generation and packet signing contract between Rust and TypeScript.
-- [x] **Two-Tier Inbound Rendezvous Listener:** Nested stream negotiation yielding bidirectional DataStream sockets.
-- [x] **Obsidian Cyberdeck UI:** Single-window desktop layout, live circuit telemetry indicators, and status event feeds.
-
-### 📋 Active Backlog & Future Tasks
-
-#### Phase 1: Transport Hardening & End-to-End Verification
-- [ ] **Stream Framing & EOF Handling:** Implement explicit write stream closures (AsyncWriteExt::close) and length-prefixed packet framing to prevent reader hangs.
-- [ ] **Dual-Node Live Rendezvous Verification:** Validate live message passing across two isolated physical/VM clients over public Tor circuits.
-- [ ] **Storage & Keystore Sandboxing:** Isolate SQLite databases and Arti keystores per client profile using app_data_dir().
-
-#### Phase 2: Self-Hosted Community Nodes ("Decks")
-- [ ] **Headless Daemon Target (--headless):** Run the Rust backend as a lightweight CLI binary on 24/7 low-resource environments (Raspberry Pi, VPS).
-- [ ] **Ephemeral Channel Ring Buffers:** Bounded SQLite retention (FIFO cap of 500–1,000 messages, 7-day TTL auto-purge, zero server-side file retention).
-- [ ] **Store-and-Forward Mailbox Queue:** Encrypted message drops held temporarily by community nodes until offline peers reconnect.
-
-#### Phase 3: Real-Time Media & Mobile Companion Support
-- [ ] **Tor-Signaled WebRTC Voice/Video:** Route SDP offers and ICE candidates through Tor circuits to negotiate direct end-to-end encrypted UDP media streams.
-- [ ] **Mobile Companion Protocol:** Client-only mobile pairing model using blind-token push gateways to bypass mobile background Tor restrictions.
-
----
-
-## 🚀 Getting Started
+## Getting Started
 
 ### System Prerequisites
+- **Debian / Ubuntu:** `sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev`
+- **Arch Linux:** `sudo pacman -S --needed webkit2gtk-4.1 base-devel curl wget openssl gtk3`
 
-Install standard WebKitGTK and build tools:
-
-**Debian / Ubuntu:**
-```bash
-sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
-```
-
-**Arch Linux:**
-```bash
-sudo pacman -S --needed webkit2gtk-4.1 base-devel curl wget openssl gtk3
-```
-
-### Development
-```bash
-npm install
-npm run tauri dev
-```
-
-### Production Build
-```bash
-npm run build
-npm run tauri build
-```
+### Local Development & Production Build
+1. Install dependencies: `npm install`
+2. Start dev environment: `npm run tauri dev`
+3. Build release binaries (`.AppImage` & `.deb`): `npm run build && npm run tauri build`
 
 ---
 
-## 📜 License & Terms of Use
+## License
+This project is licensed under the **GNU Affero General Public License v3 (AGPLv3)** — see [LICENSE](LICENSE) for details.
 
-This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**:
-
-* **Source Code & Network Engine:** All code, network transport mechanisms, and build logic are free software licensed under **AGPLv3**. Anyone modifying, self-hosting, or interacting with the network software must keep all derivative works open-source under the exact same AGPL terms.
-* **Brand Identity & Creative Design (All Rights Reserved):** The "NullPoint" brand name, custom logos, visual design identity, and distinct UI styling are **© 2026 Michael Voorhies. All Rights Reserved.** The AGPL license grants rights to the software codebase, but does not grant permission to use the brand name or proprietary visual assets for separate distributions without authorization.
+### Copyleft & Distribution Terms
+- **Source Disclosure:** Any party modifying this software or offering it over a network must provide their complete source code under the identical AGPLv3 license.
+- **Brand Protection:** The "NullPoint" name, logos, and UI assets are proprietary. Independent forks or redistributions must be rebranded and cannot use the official project identity.
