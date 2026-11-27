@@ -22,7 +22,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: 'npm'
 
       - name: Install Rust stable
@@ -41,3 +41,39 @@ jobs:
           releaseBody: 'Zero-server encrypted P2P communication client powered by Argon2id, ChaCha20-Poly1305, and embedded Tor v3 (Arti).'
           releaseDraft: false
           prerelease: false
+
+  publish-arch-repo:
+    needs: build-linux
+    permissions:
+      contents: write
+    runs-on: ubuntu-22.04
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Arch package & generate pacman DB
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          pacman -Syu --noconfirm pacman-contrib curl jq
+          useradd -m builder
+          mkdir -p /build && cp aur/nullpoint-bin/PKGBUILD /build/
+          chown -R builder:builder /build
+          VER="${TAG_NAME#v}"
+          DEB_URL=$(curl -sL "https://api.github.com/repos/${{ github.repository }}/releases/tags/${TAG_NAME}" | jq -r '.assets[] | select(.name | endswith(".deb")) | .browser_download_url' | head -n 1)
+          sed -i "s/^pkgver=.*/pkgver=${VER}/" /build/PKGBUILD
+          sed -i "s|source=.*|source=(\"nullpoint-bin-${VER}.deb::${DEB_URL}\")|" /build/PKGBUILD
+          su builder -c "cd /build && updpkgsums && makepkg -f --noconfirm"
+          mkdir -p /repo
+          cp /build/*.pkg.tar.zst /repo/
+          repo-add /repo/nullpoint.db.tar.gz /repo/*.pkg.tar.zst
+
+      - name: Publish to rolling arch-repo GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: arch-repo
+          name: Arch Linux Pacman Repository
+          body: Rolling Arch Linux pacman repository for nullpoint-bin.
+          files: /repo/*
