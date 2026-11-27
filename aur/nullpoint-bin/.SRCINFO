@@ -1,0 +1,19 @@
+pkgbase = nullpoint-bin
+	pkgdesc = Zero-server, encrypted P2P communication client powered by embedded Tor v3 (Arti) and Argon2id
+	pkgver = 0.2.0
+	pkgrel = 1
+	url = https://github.com/NiightGamez/discord-p2p
+	arch = x86_64
+	license = AGPL-3.0-or-later
+	depends = webkit2gtk-4.1
+	depends = gtk3
+	depends = libayatana-appindicator
+	depends = openssl
+	depends = dbus
+	provides = nullpoint
+	conflicts = nullpoint
+	options = !strip
+	source = nullpoint-bin-0.2.0.deb::https://github.com/NiightGamez/nullpoint/releases/download/v0.2.0/NullPoint_0.2.0_amd64.deb
+	sha256sums = b47c250a9b4e39f0467d1609b5663593d9d59561e70a59d462bae8c0a6cac78a
+
+pkgname = nullpoint-bin
