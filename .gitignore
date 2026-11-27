@@ -12,3 +12,9 @@ target/
 *.log
 .env
 .env.*
+
+# AUR makepkg build artifacts
+aur/*/pkg/
+aur/*/src/
+aur/*/*.deb
+aur/*/*.pkg.tar.*

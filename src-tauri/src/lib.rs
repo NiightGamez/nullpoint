@@ -1,3 +1,5 @@
+mod vault;
+use vault::{AccountProfile, CreatedAccountResult, VaultState};
 use safelog::DisplayRedacted;
 use arti_client::{TorClient, TorClientConfig};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -292,12 +294,190 @@ async fn trigger_native_notification(
     }
 }
 
+
+
+#[tauri::command]
+fn set_keyring_remember(
+    username: String,
+    password: String,
+    remember: bool,
+) -> Result<(), String> {
+    let entry = keyring::Entry::new("nullpoint-vault", &username)
+        .map_err(|e| format!("Keyring init failed: {e}"))?;
+    if remember {
+        entry
+            .set_password(&password)
+            .map_err(|e| format!("Failed to store in OS keyring: {e}"))?;
+    } else {
+        let _ = entry.delete_credential();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn try_keyring_auto_unlock(
+    vault: State<'_, VaultState>,
+) -> Result<Option<AccountProfile>, String> {
+    let Some(profile) = vault.has_account()? else {
+        return Ok(None);
+    };
+    let Ok(entry) = keyring::Entry::new("nullpoint-vault", &profile.username) else {
+        return Ok(None);
+    };
+    match entry.get_password() {
+        Ok(saved_pw) => match vault.unlock_account(saved_pw) {
+            Ok(unlocked) => Ok(Some(unlocked)),
+            Err(_) => Ok(None),
+        },
+        Err(_) => Ok(None),
+    }
+}
+
+#[tauri::command]
+fn lock_and_forget_keyring(vault: State<'_, VaultState>) -> Result<(), String> {
+    if let Some(profile) = vault.active_profile.lock().unwrap().take() {
+        if let Ok(entry) = keyring::Entry::new("nullpoint-vault", &profile.username) {
+            let _ = entry.delete_credential();
+        }
+    }
+    if let Some(mut seed) = vault.unlocked_seed.lock().unwrap().take() {
+        use zeroize::Zeroize;
+        seed.zeroize();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn save_to_password_manager(
+    username: String,
+    account_tag: String,
+    password: String,
+    recovery_kit_uri: String,
+    app: AppHandle,
+) -> Result<String, String> {
+    // 1. Try 1Password CLI (`op`) first for zero-disk direct creation
+    if let Ok(op_check) = std::process::Command::new("op").arg("--version").output() {
+        if op_check.status.success() {
+            let title = format!("NullPoint ({})", account_tag);
+            let out = std::process::Command::new("op")
+                .args([
+                    "item",
+                    "create",
+                    "--category=login",
+                    &format!("--title={}", title),
+                    "--url=nullpoint://vault",
+                    &format!("username={}", username),
+                    &format!("password={}", password),
+                    &format!("notesPlain={}", recovery_kit_uri),
+                ])
+                .output();
+            if let Ok(res) = out {
+                if res.status.success() {
+                    return Ok("1PASSWORD_DIRECT".to_string());
+                }
+            }
+        }
+    }
+
+    // 2. Fallback: write universal Bitwarden / 1Password / KeePassXC import CSV to Downloads
+    let dl_dir = app
+        .path()
+        .download_dir()
+        .or_else(|_| app.path().document_dir())
+        .map_err(|e| format!("Could not locate Downloads folder: {e}"))?;
+    std::fs::create_dir_all(&dl_dir).map_err(|e| e.to_string())?;
+    let safe_name: String = username
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    let csv_path = dl_dir.join(format!(
+        "nullpoint-{}-password-manager-import.csv",
+        if safe_name.is_empty() { "account" } else { &safe_name }
+    ));
+    let esc = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let csv_body = format!(
+        "name,url,username,password,notes
+{},{},{},{},{}
+",
+        esc(&format!("NullPoint ({})", account_tag)),
+        esc("nullpoint://vault"),
+        esc(&username),
+        esc(&password),
+        esc(&recovery_kit_uri)
+    );
+    std::fs::write(&csv_path, csv_body).map_err(|e| format!("Failed to write CSV: {e}"))?;
+    Ok(csv_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn check_local_account(vault: State<'_, VaultState>) -> Result<Option<AccountProfile>, String> {
+    vault.has_account()
+}
+
+#[tauri::command]
+fn create_vault_account(
+    username: String,
+    password: String,
+    vault: State<'_, VaultState>,
+) -> Result<CreatedAccountResult, String> {
+    vault.create_account(username, password)
+}
+
+#[tauri::command]
+fn unlock_vault_account(
+    password: String,
+    vault: State<'_, VaultState>,
+) -> Result<AccountProfile, String> {
+    vault.unlock_account(password)
+}
+
+#[tauri::command]
+fn recover_vault_account(
+    recovery_input: String,
+    recovery_password: String,
+    new_local_password: String,
+    override_username: Option<String>,
+    vault: State<'_, VaultState>,
+) -> Result<AccountProfile, String> {
+    vault.recover_account(recovery_input, recovery_password, new_local_password, override_username)
+}
+
+#[tauri::command]
+fn save_npkey_backup(
+    username: String,
+    recovery_kit_uri: String,
+    app: AppHandle,
+) -> Result<String, String> {
+    let docs_dir = app
+        .path()
+        .document_dir()
+        .or_else(|_| app.path().app_local_data_dir())
+        .map_err(|e| format!("Failed to locate backup folder: {e}"))?;
+    let backup_dir = docs_dir.join("NullPoint");
+    std::fs::create_dir_all(&backup_dir).map_err(|e| format!("Failed to create backup dir: {e}"))?;
+    let safe_name: String = username
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    let file_path = backup_dir.join(format!("{}.npkey", if safe_name.is_empty() { "account" } else { &safe_name }));
+    std::fs::write(&file_path, recovery_kit_uri).map_err(|e| format!("Failed to write .npkey file: {e}"))?;
+    Ok(file_path.to_string_lossy().to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let handle: AppHandle = app.handle().clone();
+            let vault_dir = app
+                .path()
+                .app_local_data_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from(".nullpoint"));
+            let vault_state = VaultState::new(vault_dir.join("vault.db"))
+                .expect("Failed to initialize NullPoint encrypted vault");
+            app.manage(vault_state);
+
 
             tauri::async_runtime::block_on(async move {
                 let main_sock = Arc::new(
@@ -436,6 +616,15 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            set_keyring_remember,
+            try_keyring_auto_unlock,
+            lock_and_forget_keyring,
+            save_to_password_manager,
+            check_local_account,
+            create_vault_account,
+            unlock_vault_account,
+            recover_vault_account,
+            save_npkey_backup,
             init_node,
             send_packet,
             generate_new_identity,
